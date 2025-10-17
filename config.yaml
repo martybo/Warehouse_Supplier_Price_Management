@@ -1,0 +1,9 @@
+# loader config (v1)
+inputs:
+  price_workbook: "Medicare Listings Price Comparison.xlsx"   # Excel file in the same folder
+  sheet_name: "Price Comparison"
+  column_mapping_csv: "Column_classification_overview.csv"
+  supplier_alias_csv: "supplier_alias_proposal.csv"
+
+outputs:
+  dir: "out"         # created if not present
