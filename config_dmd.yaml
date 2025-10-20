@@ -1,0 +1,16 @@
+inputs:
+  file: "dmd_weekly_extract.xlsx"
+  format: "xlsx"
+columns:
+  effective_date: "Effective Date"
+  dt_price: "DT Price"
+  dt_cat: "DT Category"
+  vmpp_id: "VMPP ID"
+  ampp_id: "AMPP ID"
+  vtm_id: "VTM ID"
+  pack_size: "Pack Size"
+  pip_code: "PIP Code"
+  nm: "Name"
+product_file: "out/products.csv"
+outputs:
+  dir: "out_dmd"
