@@ -1,105 +1,135 @@
 #!/usr/bin/env python3
-# (see file header in previous cell; shortened here for brevity in generation)
-
-import pandas as pd
-import yaml
+# dm+d Importer (v2.2) — VMPP pack size pulled from VMPP sheet and merged by VPPID
+import os, pandas as pd, json, re
 from datetime import datetime
-import re
-import os
 
 def log(msg): print(f"[{datetime.utcnow().isoformat()}Z] {msg}", flush=True)
 
-def load_any(path, fmt):
-    if fmt.lower() == "csv":
-        return pd.read_csv(path)
-    elif fmt.lower() == "xlsx":
-        return pd.read_excel(path)
-    else:
-        raise ValueError("inputs.format must be csv or xlsx")
+# ---------- Helpers ----------
+def read_vmpp(path):
+    df_info = pd.read_excel(path, sheet_name="DtInfo")
+    df_vmpp = pd.read_excel(path, sheet_name="VMPP")
+    df_info.columns = [c.strip() for c in df_info.columns]
+    df_vmpp.columns = [c.strip() for c in df_vmpp.columns]
+    return df_info, df_vmpp
 
-def coerce_date(series):
-    return pd.to_datetime(series, errors="coerce").dt.date
+def read_ampp(path):
+    df = pd.read_excel(path)  # first sheet
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-def normalise_cols(df, colmap):
-    out = pd.DataFrame()
-    out["effective_date"] = coerce_date(df[colmap["effective_date"]])
-    out["dt_price"] = pd.to_numeric(df[colmap["dt_price"]], errors="coerce")
-    out["dt_cat"] = df[colmap["dt_cat"]].astype(str)
-    def opt(key, default=None):
-        col = colmap.get(key)
-        return df[col] if col and col in df.columns else default
-    out["vmpp_id"] = opt("vmpp_id")
-    out["ampp_id"] = opt("ampp_id")
-    out["vtm_id"] = opt("vtm_id")
-    out["dt_pack_size"] = opt("pack_size")
-    out["pip_code"] = opt("pip_code")
-    out["name"] = opt("nm")
-    out = out.dropna(subset=["effective_date"]).copy()
-    return out
+def read_lookup(path):
+    df = pd.read_excel(path, sheet_name="DtPayCat")
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-def normalise_name(s):
-    if pd.isna(s): return ""
-    s = str(s).lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def find_col(df, *cands, required=True):
+    for n in cands:
+        if n in df.columns:
+            return n
+    if required:
+        raise KeyError(f"None of {cands} found in columns: {df.columns.tolist()}")
+    return None
 
-def suggest_mappings(dmd_df, products_df):
-    sug = []
-    dmd_by_pip = {}
-    if "pip_code" in dmd_df.columns:
-        for _,r in dmd_df.dropna(subset=["pip_code"]).iterrows():
-            dmd_by_pip.setdefault(str(r["pip_code"]).strip(), []).append(r)
-    dmd_df["nm_norm"] = dmd_df.get("name","").apply(normalise_name)
-    for _, p in products_df.iterrows():
-        pip = str(p["medicare_pip"]).strip() if pd.notna(p["medicare_pip"]) else ""
-        pname = normalise_name(p["name"])
-        psize = str(p.get("pack_size","")).strip().lower()
-        candidates = []
-        if pip and pip in dmd_by_pip:
-            for r in dmd_by_pip[pip]:
-                candidates.append(("pip", r))
-        if not candidates and pname:
-            subset = dmd_df[dmd_df["nm_norm"].str.contains(pname[:30], na=False)]
-            if psize:
-                subset = subset[subset.get("dt_pack_size","").astype(str).str.lower().str.contains(psize, na=False)]
-            for _,r in subset.head(5).iterrows():
-                candidates.append(("name", r))
-        if candidates:
-            tag, r = candidates[0]
-            sug.append({
-                "product_medicare_pip": pip,
-                "product_name": p["name"],
-                "dmd_match_type": tag,
-                "vmpp_id": r.get("vmpp_id",""),
-                "ampp_id": r.get("ampp_id",""),
-                "vtm_id": r.get("vtm_id",""),
-                "dt_cat": r.get("dt_cat",""),
-                "dt_price": r.get("dt_price",""),
-                "dt_pack_size": r.get("dt_pack_size",""),
-                "effective_date": r.get("effective_date",""),
-                "dmd_name": r.get("name","")
-            })
-    return pd.DataFrame(sug)
-
+# ---------- Main ----------
 def main():
-    with open("config_dmd.yaml","r") as f:
-        cfg = yaml.safe_load(f)
-    df = load_any(cfg["inputs"]["file"], cfg["inputs"]["format"])
-    colmap = cfg["columns"]
-    dmd_norm = normalise_cols(df, colmap)
-    outdir = cfg.get("outputs",{}).get("dir","out_dmd")
+    # File names (keep next to this script)
+    f_vmpp = "f_vmpp.xlsx"
+    f_ampp = "f_ampp.xlsx"
+    f_lookup = "f_lookup.xlsx"
+
+    info, vmpp_tab = read_vmpp(f_vmpp)
+    ampp_raw      = read_ampp(f_ampp)
+    lookup        = read_lookup(f_lookup)
+
+    # Keys/fields in DtInfo (VMPP level)
+    VPPID_info = find_col(info, "VPPID")
+    PRICE_info = find_col(info, "PRICE")
+    DT_info    = find_col(info, "DT", "PRICE_DT", "EFFECTIVE_DT")
+    PAYCD_info = find_col(info, "PAY_CATCD", "PAYCATCD", "PAY_CAT_CD")
+
+    # Pack size lives in VMPP tab → detect best column and merge by VPPID
+    VPPID_vmpp = find_col(vmpp_tab, "VPPID", "VMPP", "VMPP_ID", "VPP_ID", "VMPPID")
+    PACK_vmpp  = find_col(vmpp_tab, "QTVAL", "QTYVAL", "QTY", "PACK_SIZE", "QTY_VAL", "QTY VALUE", required=False)
+
+    # Build base VMPP dataframe from DtInfo
+    vmpp = pd.DataFrame({
+        "VPPID":          info[VPPID_info],
+        "dt_price":       pd.to_numeric(info[PRICE_info], errors="coerce"),
+        "effective_date": pd.to_datetime(info[DT_info], errors="coerce").dt.date,
+        "pay_catcd":      info[PAYCD_info].astype(str).str.strip()
+    })
+    # Attach pack size from VMPP tab (if found)
+    if PACK_vmpp:
+        vmpp = vmpp.merge(
+            vmpp_tab[[VPPID_vmpp, PACK_vmpp]].rename(columns={VPPID_vmpp: "VPPID", PACK_vmpp: "dt_pack_size"}),
+            on="VPPID", how="left"
+        )
+    else:
+        vmpp["dt_pack_size"] = None
+
+    vmpp = vmpp.rename(columns={"VPPID": "vmpp_id"})
+    vmpp = vmpp.dropna(subset=["vmpp_id", "effective_date"]).copy()
+
+    # Attach category name from lookup if present
+    L_CODE = find_col(lookup, "PAY_CATCD", "PAYCATCD", "PAY_CAT_CD", "Code")
+    L_NAME = find_col(lookup, "PAY_CATNM", "PAY_CAT", "Name", required=False)
+    if L_NAME:
+        lk = lookup[[L_CODE, L_NAME]].copy()
+        lk[L_CODE] = lk[L_CODE].astype(str).str.strip()
+        vmpp = vmpp.merge(lk, left_on="pay_catcd", right_on=L_CODE, how="left") \
+                   .rename(columns={L_NAME: "pay_cat_name"}) \
+                   .drop(columns=[L_CODE])
+    else:
+        vmpp["pay_cat_name"] = None
+
+    # AMPP (price + ZD)
+    APPID = find_col(ampp_raw, "APPID")
+    APR   = find_col(ampp_raw, "PRICE")
+    ADT   = find_col(ampp_raw, "PRICEDT", "PRICE_DT", "EFFECTIVE_DT")
+    AZD   = find_col(ampp_raw, "ZERO_DISCD", "ZERO_DISCOUNT", required=False)
+
+    ampp = pd.DataFrame({
+        "ampp_id":       ampp_raw[APPID],
+        "dt_price":      pd.to_numeric(ampp_raw[APR], errors="coerce"),
+        "effective_date": pd.to_datetime(ampp_raw[ADT], errors="coerce").dt.date,
+        "zero_discount": ampp_raw[AZD].astype(str).str.strip().isin(["0001", "0002"]) if AZD else False
+    }).dropna(subset=["ampp_id", "effective_date"]).copy()
+
+    # Emit dmd_items: VMPP rows (with dt_pack_size & PAY_CATCD) + AMPP rows (no pack/category)
+    dmd_items_vmpp = vmpp.assign(vtm_id=None, ampp_id=None, dt_cat=vmpp["pay_catcd"]) \
+                         [["vmpp_id", "ampp_id", "vtm_id", "dt_cat", "dt_price", "dt_pack_size", "effective_date"]]
+    dmd_items_ampp = ampp.assign(vmpp_id=None, vtm_id=None, dt_cat=None, dt_pack_size=None) \
+                         [["vmpp_id", "ampp_id", "vtm_id", "dt_cat", "dt_price", "dt_pack_size", "effective_date"]]
+    dmd_items = pd.concat([dmd_items_vmpp, dmd_items_ampp], ignore_index=True)
+
+    # Emit attributes: VMPP category names + AMPP ZD flags (kept separate for clarity)
+    dmd_attr_vmpp = vmpp[["vmpp_id", "pay_catcd", "pay_cat_name", "effective_date"]].copy()
+    dmd_attr_vmpp.insert(1, "level", "VMPP")
+    dmd_attr_vmpp.insert(2, "zero_discount", False)
+    dmd_attr_vmpp = dmd_attr_vmpp.rename(columns={"vmpp_id": "dmd_key"})
+
+    dmd_attr_ampp = ampp[["ampp_id", "zero_discount", "effective_date"]].copy()
+    dmd_attr_ampp.insert(1, "level", "AMPP")
+    dmd_attr_ampp.insert(3, "pay_catcd", None)
+    dmd_attr_ampp.insert(4, "pay_cat_name", None)
+    dmd_attr_ampp = dmd_attr_ampp.rename(columns={"ampp_id": "dmd_key"})
+
+    dmd_attributes = pd.concat([dmd_attr_vmpp, dmd_attr_ampp], ignore_index=True)
+
+    # Save
+    outdir = "out_dmd_v2"
     os.makedirs(outdir, exist_ok=True)
-    dmd_items = dmd_norm[["vmpp_id","ampp_id","vtm_id","dt_cat","dt_price","dt_pack_size","effective_date"]].copy()
-    dmd_items.to_csv(os.path.join(outdir,"dmd_items.csv"), index=False)
-    products_path = cfg.get("product_file","out/products.csv")
-    if os.path.exists(products_path):
-        products = pd.read_csv(products_path)
-        suggestions = suggest_mappings(dmd_norm, products)
-        suggestions.to_csv(os.path.join(outdir,"mapping_suggestions.csv"), index=False)
-    manifest = {"rows":{"dmd_items": len(dmd_items)}, "inputs": cfg["inputs"], "created_at_utc": datetime.utcnow().isoformat()+"Z"}
-    import json; json.dump(manifest, open(os.path.join(outdir,"manifest.json"),"w"), indent=2)
-    log("Done.")
+    dmd_items.to_csv(os.path.join(outdir, "dmd_items.csv"), index=False)
+    dmd_attributes.to_csv(os.path.join(outdir, "dmd_attributes.csv"), index=False)
+    with open(os.path.join(outdir, "manifest.json"), "w") as f:
+        json.dump({
+            "rows": {"dmd_items": len(dmd_items), "dmd_attributes": len(dmd_attributes)},
+            "created_at_utc": datetime.utcnow().isoformat() + "Z",
+            "notes": "Pack size merged from VMPP sheet via VPPID (columns tried: QTVAL/QTYVAL/QTY/PACK_SIZE/QTY_VAL/QTY VALUE)"
+        }, f, indent=2)
+
+    log("Done (dm+d v2.2).")
 
 if __name__ == "__main__":
     main()
