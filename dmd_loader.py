@@ -32,11 +32,45 @@ def read_vmpp(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def read_ampp(path: Path) -> pd.DataFrame:
-    """Return the AMPP table (first sheet) with stripped column names."""
+    """Return the AMPP sheet containing price information."""
 
-    df = pd.read_excel(path)  # first sheet
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    # ``f_ampp`` workbooks vary – sometimes the first sheet holds the price,
+    # other times the reimbursement status sheet comes first.  Load every
+    # sheet, strip the column names, and select the first one that exposes both
+    # ``APPID`` and a recognisable price column.
+    sheets = pd.read_excel(path, sheet_name=None)
+    cleaned = {
+        (name or "").strip(): df.rename(columns={c: c.strip() for c in df.columns})
+        for name, df in sheets.items()
+    }
+
+    price_aliases = {"PRICE", "REIMB_PRICE", "REIMBPRICE", "PRICE_PENCE"}
+    for sheet_name in (
+        "AMPPrice",
+        "AMPP",
+        "Prices",
+    ):
+        df = cleaned.get(sheet_name)
+        if df is not None and "APPID" in df.columns and price_aliases & set(df.columns):
+            log(f"Using AMPP sheet '{sheet_name}'.")
+            return df
+
+    for sheet_name, df in cleaned.items():
+        if "APPID" not in df.columns:
+            continue
+        if price_aliases & set(df.columns):
+            log(f"Using AMPP sheet '{sheet_name}'.")
+            return df
+
+    sheet_summaries = {
+        name: list(df.columns)
+        for name, df in cleaned.items()
+    }
+    raise KeyError(
+        "Unable to locate an AMPP sheet containing both 'APPID' and a price "
+        f"column (candidates: {sorted(price_aliases)}). Available sheets: "
+        f"{sheet_summaries}"
+    )
 
 
 def read_lookup(path: Path) -> pd.DataFrame:
@@ -140,8 +174,8 @@ def main(base_path: Optional[Path] = None) -> None:
 
     # AMPP (price + ZD)
     APPID = find_col(ampp_raw, "APPID")
-    APR   = find_col(ampp_raw, "PRICE")
-    ADT   = find_col(ampp_raw, "PRICEDT", "PRICE_DT", "EFFECTIVE_DT")
+    APR   = find_col(ampp_raw, "PRICE", "REIMB_PRICE", "REIMBPRICE", "PRICE_PENCE")
+    ADT   = find_col(ampp_raw, "PRICEDT", "PRICE_DT", "EFFECTIVE_DT", "REIMBSTATDT", "REIMB_STATDT")
     AZD   = find_col(ampp_raw, "ZERO_DISCD", "ZERO_DISCOUNT", required=False)
 
     zero_discount = (
