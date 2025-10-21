@@ -125,8 +125,8 @@ def main(base_path: Optional[Path] = None) -> None:
     vmpp = vmpp.dropna(subset=["vmpp_id", "effective_date"]).copy()
 
     # Attach category name from lookup if present
-    L_CODE = find_col(lookup, "PAY_CATCD", "PAYCATCD", "PAY_CAT_CD", "Code")
-    L_NAME = find_col(lookup, "PAY_CATNM", "PAY_CAT", "Name", required=False)
+    L_CODE = find_col(lookup, "PAY_CATCD", "PAYCATCD", "PAY_CAT_CD", "Code", "CD")
+    L_NAME = find_col(lookup, "PAY_CATNM", "PAY_CAT", "Name", "DESC", required=False)
     if L_NAME is not None:
         lk = lookup[[L_CODE, L_NAME]].copy()
         lk[L_CODE] = lk[L_CODE].astype(str).str.strip()
