@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>dm+d Mapping Reviewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; color: #222; }
+      .wrap { max-width: 1000px; margin: 0 auto; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 8px 0; }
+      .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; background: #fff; }
+      h1 { font-size: 20px; margin: 0 0 8px; }
+      h2 { font-size: 16px; margin: 0 0 8px; }
+      .meta { color: #555; font-size: 12px; }
+      .actions { margin-top: 16px; display: flex; gap: 8px; }
+      button { padding: 10px 14px; border-radius: 6px; border: 1px solid #ccc; cursor: pointer; }
+      button.primary { background: #0d6efd; color: white; border-color: #0d6efd; }
+      button.warn { background: #f8f9fa; color: #444; }
+      .grid { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; }
+      .label { color: #666; }
+      .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+      .badge.good { background: #e6f4ea; color: #1e7e34; }
+      .badge.warn { background: #fff3cd; color: #7a5e00; }
+      .badge.zd { background: #e7f1ff; color: #084298; }
+      .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+      .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f1f3f5; padding:2px 6px; border-radius:4px; }
+      .empty { color:#777; text-align:center; padding:24px; border:1px dashed #ccc; border-radius:8px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="topbar">
+        <h1>dm+d Mapping Reviewer</h1>
+        <div class="meta">Keys: <span class="kbd">A</span> Approve · <span class="kbd">S</span> Skip · <span class="kbd">N</span> Next</div>
+      </div>
+      <label><input type="checkbox" id="packmatch"> Only exact pack-size matches first</label>
+      <div id="content"></div>
+      <div class="actions">
+        <button class="warn" id="btnNext">Next (N)</button>
+        <button class="primary" id="btnApprove">Approve (A)</button>
+        <button class="warn" id="btnSkip">Skip (S)</button>
+      </div>
+      <p class="meta" id="stats"></p>
+    </div>
+    <script>
+      const API_TOKEN = "{{ api_token }}";
+      const content = document.getElementById('content');
+      const statsEl = document.getElementById('stats');
+      const packmatch = document.getElementById('packmatch');
+
+      async function api(path, opts={}) {
+        const res = await fetch(path, {
+          ...opts,
+          headers: { 'Content-Type': 'application/json', 'X-API-Token': API_TOKEN }
+        });
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      }
+
+      function field(label, value, extraClass="") {
+        return `<div class="label">${label}</div><div class="${extraClass}">${value ?? ""}</div>`;
+      }
+
+      function renderStage(s) {
+        if (!s) {
+          content.innerHTML = `<div class="empty">No more candidates match your filter. Try unticking <em>Only exact pack-size matches</em>.</div>`;
+          return;
+        }
+        const packBadge = (s.product_pack && s.dmd_pack && s.product_pack.toString().replace(/[^0-9.]/g,'') === (s.dmd_pack||'').toString().replace(/[^0-9.]/g,''))
+          ? `<span class="badge good">Pack size matches</span>`
+          : `<span class="badge warn">Check pack size</span>`;
+
+        const zd = s.zero_discount ? `<span class="badge zd">Zero Discount</span>` : "";
+        content.innerHTML = `
+          <div class="row">
+            <div class="card">
+              <h2>Warehouse product</h2>
+              <div class="grid">
+                ${field("PIP", s.pip)}
+                ${field("Name", s.product_name)}
+                ${field("Pack", s.product_pack)}
+              </div>
+            </div>
+            <div class="card">
+              <h2>dm+d candidate</h2>
+              <div class="grid">
+                ${field("Level", s.dmd_level)}
+                ${field("ID", s.dmd_level === "VMPP" ? s.vmpp_id : s.ampp_id)}
+                ${field("Name", s.dmd_name || "<em>(name not loaded)</em>")}
+                ${field("Pack", s.dmd_pack)} 
+                ${field("DT Price", s.dmd_price)}
+                ${field("Category", s.pay_cat_name || s.dmd_cat)}
+                ${field("Flags", `${packBadge} ${zd}`)}
+              </div>
+            </div>
+          </div>
+          <div class="meta">Stage #${s.stage_id} · ${s.already_mapped ? "Already mapped" : "Not mapped"} </div>
+        `;
+        content.dataset.stageId = s.stage_id;
+      }
+
+      async function refresh() {
+        const q = packmatch.checked ? "?packmatch=1" : "";
+        const data = await api("/api/next"+q);
+        renderStage(data.stage);
+        const stats = await api("/api/stats");
+        const st = stats.stats;
+        statsEl.textContent = `Staged: ${st.staged} · Approved (stage): ${st.approved_stage} · Mapped products: ${st.mapped_products} / ${st.total_products}`;
+      }
+
+      document.getElementById('btnNext').onclick = refresh;
+      document.getElementById('btnApprove').onclick = async () => {
+        const sid = content.dataset.stageId;
+        if (!sid) return;
+        await api("/api/approve", { method:"POST", body: JSON.stringify({stage_id: Number(sid)}) });
+        await refresh();
+      };
+      document.getElementById('btnSkip').onclick = async () => {
+        const sid = content.dataset.stageId;
+        if (!sid) return;
+        const note = prompt("Add a note for this skip (optional):") || "";
+        await api("/api/skip", { method:"POST", body: JSON.stringify({stage_id: Number(sid), note}) });
+        await refresh();
+      };
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key.toLowerCase() === 'a') document.getElementById('btnApprove').click();
+        if (e.key.toLowerCase() === 's') document.getElementById('btnSkip').click();
+        if (e.key.toLowerCase() === 'n') document.getElementById('btnNext').click();
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>
