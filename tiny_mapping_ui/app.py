@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import os, re, datetime
+import datetime
+import os
+from contextlib import contextmanager
+
 from flask import Flask, request, jsonify, render_template, abort
-import psycopg2
+from psycopg2 import extensions, pool
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
@@ -20,8 +23,27 @@ API_TOKEN = os.getenv("API_TOKEN","change-me")
 
 app = Flask(__name__)
 
+_POOL = pool.SimpleConnectionPool(
+    1,
+    int(os.getenv("DATABASE_MAX_CONNECTIONS", "5")),
+    **DB,
+)
+
+
+@contextmanager
 def get_conn():
-    return psycopg2.connect(**DB)
+    conn = _POOL.getconn()
+    try:
+        yield conn
+    finally:
+        try:
+            if (
+                not conn.autocommit
+                and conn.get_transaction_status() != extensions.TRANSACTION_STATUS_IDLE
+            ):
+                conn.rollback()
+        finally:
+            _POOL.putconn(conn)
 
 def require_token():
     token = request.headers.get("X-API-Token") or request.args.get("token")
@@ -46,12 +68,16 @@ def fetch_next(packmatch_only=False):
         AND dmd_item_id IS NOT NULL
     )
     SELECT stage_id FROM cand
-    WHERE %s OR p_sz IS NULL OR d_sz IS NULL OR p_sz = d_sz
+    WHERE (
+        %s AND p_sz IS NOT NULL AND d_sz IS NOT NULL AND p_sz = d_sz
+    ) OR (
+        NOT %s AND (p_sz IS NULL OR d_sz IS NULL OR p_sz = d_sz)
+    )
     ORDER BY stage_id
     LIMIT 1;
     """
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (packmatch_only,))
+        cur.execute(sql, (packmatch_only, packmatch_only))
         row = cur.fetchone()
         if not row:
             return None
@@ -94,15 +120,13 @@ def api_approve():
         if row[0]:
             return jsonify({"ok": True, "message": "Already mapped"})
         # choose batch id for today
-        seq=1
-        batch_id = f"{BATCH_PREFIX}_{datetime.date.today().strftime('%Y%m%d')}_{seq}"
+        seq = 1
         while True:
+            batch_id = today_batch_id(seq)
             cur.execute("SELECT 1 FROM product_mapping WHERE batch_id=%s LIMIT 1;", (batch_id,))
-            if cur.fetchone():
-                seq += 1
-                batch_id = f"{BATCH_PREFIX}_{datetime.date.today().strftime('%Y%m%d')}_{seq}"
-            else:
+            if not cur.fetchone():
                 break
+            seq += 1
         cur.execute("""
           INSERT INTO product_mapping (product_id, dmd_item_id, confidence_score, approved_by, approved_at, batch_id)
           SELECT product_id, dmd_item_id, 1.0, %s, now(), %s
@@ -122,7 +146,12 @@ def api_skip():
     if not sid:
         abort(400, description="stage_id required")
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE mapping_stage SET reviewed=TRUE, review_notes=%s, reviewer=%s WHERE id=%s;", (note, APPROVER, sid))
+        cur.execute(
+            "UPDATE mapping_stage SET reviewed=TRUE, review_notes=%s, reviewer=%s WHERE id=%s;",
+            (note, APPROVER, sid),
+        )
+        if cur.rowcount == 0:
+            abort(404, description="stage_id not found")
         conn.commit()
     return jsonify({"ok": True, "skipped": sid})
 
